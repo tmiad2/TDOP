@@ -1,6 +1,7 @@
 #include <assert.h>
 #include <ctype.h>
 #include <functional>
+#include <gmp.h>
 #include <memory>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,15 +29,82 @@ raise ParseError("%s can't be used in infix position" % token)
 
 struct Token {
 
-  Token(long i) : value{i}, type{Type::Integer} {}
+  constexpr Token(const Token &other) : type{other.type} { *this = other; }
+  constexpr Token &operator=(const Token &other) {
+    type = other.type;
+    switch (type) {
+    case Type::Integer:
+      value = other.value;
+      break;
+    case Type::String:
+      string = other.string;
+      break;
+    default:
+      break;
+    }
+
+    return *this;
+  }
+  ~Token() {
+    switch (type) {
+    case Type::String:
+      string.~shared_ptr<char[]>();
+      break;
+
+    case Type::BigInt:
+      mpz_clear(bigint);
+      break;
+    default:
+      break;
+    }
+  }
+
+  constexpr Token(long i) : value{i}, type{Type::Integer} {}
   union {
     long value;
-    const char *string;
+    mpz_t bigint;
+    std::shared_ptr<char[]> string;
   };
-  const enum class Type { Integer, String, Plus, Mul } type;
+  enum class Type {
+    Eof,
+    Integer,
+    String,
+    Plus,
+    Sub,
+    Mul,
+    Div,
+    Increment,
+    Decrement,
+    AddAssign,
+    MulAssign,
+    SubAssign,
+    DivAssign,
+    ModAssign,
+    AndAssign,
+    Assign,
+    OrAssign,
+    Tilde,
+    TildeAssign,
+    Equal,
+    NotEqual,
+    GreaterThan,
+    LessThan,
+    GreaterThanOrEqual,
+    LessThanOrEqual,
+    Mod,
+    Ampersand,
+    And,
+    Pipe,
+    Or,
+    Not,
+    LeftParen,
+    RightParen,
+    BigInt
+  } type;
 
-  Token(const char *_string) : string{_string}, type{Type::String} {}
-  Token(const Token::Type t) : value{0}, type{t} {}
+  Token(const std::shared_ptr<char[]> _string)
+      : string{_string}, type{Type::String} {}
+  constexpr Token(const Token::Type t) : value{0}, type{t} {}
 
   bool operator==(Token const &o) const {
     return type == o.type && value == o.value;
@@ -48,7 +116,7 @@ struct Token {
       printf("%li ", value);
       break;
     case Type::String:
-      printf("%s ", string);
+      printf("%s ", string.get());
       break;
     case Type::Plus:
       printf("+ ");
@@ -125,14 +193,47 @@ class Node(object):
 struct Node {
   explicit Node(struct Token t) : t{t} { type = Type::Leaf; }
 
+  Node(const Node &n) { *this = n; }
+
+  Node(struct Token t, const Node &n) {
+    type = Type::Tree;
+    N1 = NodeTree(t, n);
+  }
+
+  Node &operator=(const Node &n) {
+    type = n.type;
+    if (type == Type::Leaf) {
+      t = n.t;
+    } else {
+      N1 = n.N1;
+    }
+    return *this;
+  }
+
+  ~Node() {
+    switch (type) {
+    case Type::Leaf:
+      t.~Token();
+      break;
+    case Type::Tree:
+      N1.~NodeTree();
+      break;
+    }
+  }
   struct NodeTree {
+    NodeTree &operator=(const NodeTree &n) {
+      N1 = n.N1;
+      length = n.length;
+      return *this;
+    }
+
     template <class... Args>
     NodeTree(Args &&...args)
-        : N1{std::make_unique<struct Node[]>(std::forward<Args>(args)...)},
+        : N1{std::make_shared<struct Node[]>(std::forward<Args>(args)...)},
           length{sizeof...(Args)} {}
 
-    const std::unique_ptr<struct Node[]> N1; // array of operators, length long.
-    const size_t length;
+    std::shared_ptr<struct Node[]> N1; // array of operators, length long.
+    size_t length;
     struct Node &operator[](size_t i) {
       if (i < length) {
         return N1[i];
@@ -228,9 +329,9 @@ public:
 };
 class Parser;
 using NullDenotation =
-    std::function<void(Parser &, struct Token, BindingPower)>;
+    std::function<Node(Parser &, struct Token, BindingPower)>;
 using LeftDenotation =
-    std::function<void(Parser &, struct Token, Node &, RightBindingPower)>;
+    std::function<Node(Parser &, struct Token, Node &, RightBindingPower)>;
 
 struct NullInfo {
   NullInfo() = default;
@@ -247,14 +348,16 @@ struct NullInfo {
 
   static NullDenotation NullError;
 };
-NullDenotation NullInfo::NullError = [](Parser &p, struct Token t,
-                                        BindingPower _bp) {
+NullDenotation NullInfo::NullError = [](Parser &, struct Token t,
+                                        BindingPower) {
   t.print();
   printf(" cannot be used in prefix position!\n");
   abort();
+  return Node{t};
 };
 
 struct LeftInfo {
+  LeftInfo() = default;
   LeftInfo(LeftBindingPower _lbp, RightBindingPower _rbp,
            LeftDenotation _led = LeftError)
       : led{_led}, lbp{_lbp}, rbp{_rbp} {}
@@ -264,11 +367,12 @@ struct LeftInfo {
 
   static LeftDenotation LeftError;
 };
-LeftDenotation LeftInfo::LeftError = [](Parser &p, struct Token t, Node &n,
-                                        RightBindingPower _bp) {
+LeftDenotation LeftInfo::LeftError = [](Parser &, struct Token t, Node &,
+                                        RightBindingPower) {
   t.print();
   printf(" cannot be used in infix position!\n");
   abort();
+  return Node{t};
 };
 
 class ParserSpec {
@@ -306,7 +410,8 @@ public:
     _RegisterLed(bp, bp - 1, led, t...);
   }
 
-  NullInfo LookupNull(const Token t) {}
+  NullInfo LookupNull(const Token t) { return null_lookup[t.type]; }
+  LeftInfo LookupLeft(const Token t) { return left_lookup[t.type]; }
 
   std::unordered_map<Token::Type, NullInfo> null_lookup;
   std::unordered_map<Token::Type, LeftInfo> left_lookup;
@@ -361,78 +466,368 @@ except KeyError:
 return led
 */
 
-class Lexer;
+static Token EOF_TOKEN = Token{Token::Type::Eof};
 
 class Parser {
+  class Lexer {
+  public:
+    Lexer(const char *_text) : text{_text} {
+      advance();
+      advance();
+    }
+
+    Token advance() {
+      _current = _peek;
+      // Lex out next token.
+      if (!text[cursor]) {
+        _peek = Token{Token::Type::Eof};
+        return _current;
+      }
+
+      while (text[cursor] != '\0') {
+        while (text[cursor] && isspace(text[cursor])) {
+          if (text[cursor] == '\n') {
+            cursor++;
+          } else {
+            cursor++;
+          }
+        }
+        if (!text[cursor]) {
+          _peek = Token{Token::Type::Eof};
+          return _current;
+        }
+
+        switch (text[cursor]) {
+        case '(':
+          _peek = Token{Token::Type::LeftParen};
+          cursor++;
+          return current();
+        case ')':
+          _peek = Token{Token::Type::RightParen};
+          cursor++;
+          return current();
+        case '+':
+          if (text[cursor + 1] == '+') {
+            _peek = Token{Token::Type::Increment};
+            cursor++;
+            cursor++;
+            return current();
+          } else if (text[cursor + 1] == '=') {
+            _peek = Token{Token::Type::AddAssign};
+            cursor++;
+            cursor++;
+            return current();
+          } else {
+            _peek = Token{Token::Type::Plus};
+            cursor++;
+            return current();
+          }
+        case '-':
+          if (text[cursor + 1] == '-') {
+            _peek = Token{Token::Type::Decrement};
+            cursor++;
+            cursor++;
+            return current();
+          } else if (text[cursor + 1] == '=') {
+            _peek = Token{Token::Type::SubAssign};
+            cursor++;
+            cursor++;
+            return current();
+          } else {
+            _peek = Token{Token::Type::Sub};
+            cursor++;
+            return current();
+          }
+
+        case '*':
+          if (text[cursor + 1] == '=') {
+            _peek = Token{Token::Type::MulAssign};
+            cursor++;
+            cursor++;
+            return current();
+          } else {
+            _peek = Token{Token::Type::Mul};
+            cursor++;
+            return current();
+          }
+
+        case '/':
+          if (text[cursor + 1] == '=') {
+            _peek = Token{Token::Type::DivAssign};
+            cursor++;
+            cursor++;
+            return current();
+          } else {
+            _peek = Token{Token::Type::Div};
+            cursor++;
+            return current();
+          }
+
+        case '%':
+          if (text[cursor + 1] == '=') {
+            _peek = Token{Token::Type::ModAssign};
+            cursor++;
+            cursor++;
+            return current();
+          } else {
+            _peek = Token{Token::Type::Mod};
+            cursor++;
+            return current();
+          }
+
+        case '!':
+          if (text[cursor + 1] == '=') {
+            _peek = Token{Token::Type::NotEqual};
+            cursor++;
+            cursor++;
+            return current();
+          } else {
+            _peek = Token{Token::Type::Not};
+            cursor++;
+            return current();
+          }
+
+        case '=':
+          if (text[cursor + 1] == '=') {
+            _peek = Token{Token::Type::Equal};
+            cursor++;
+            cursor++;
+            return current();
+          } else {
+            _peek = Token{Token::Type::Assign};
+            cursor++;
+            return current();
+          }
+        case '<':
+          if (text[cursor + 1] == '=') {
+            _peek = Token{Token::Type::LessThanOrEqual};
+            cursor++;
+            cursor++;
+            return current();
+          } else {
+            _peek = Token{Token::Type::LessThan};
+            cursor++;
+            return current();
+          }
+        case '>':
+          if (text[cursor + 1] == '=') {
+            _peek = Token{Token::Type::LessThanOrEqual};
+            cursor++;
+            cursor++;
+            return current();
+          } else {
+            _peek = Token{Token::Type::LessThan};
+            cursor++;
+            return current();
+          }
+        case '&':
+          if (text[cursor + 1] == '=') {
+            _peek = Token{Token::Type::AndAssign};
+            cursor++;
+            cursor++;
+            return current();
+          } else if (text[cursor + 1] == '&') {
+            _peek = Token{Token::Type::And};
+            cursor++;
+            cursor++;
+            return current();
+          } else {
+            _peek = Token{Token::Type::Ampersand};
+            cursor++;
+            return current();
+          }
+        case '|':
+          if (text[cursor + 1] == '=') {
+            _peek = Token{Token::Type::OrAssign};
+            cursor++;
+            cursor++;
+            return current();
+          } else if (text[cursor + 1] == '|') {
+            _peek = Token{Token::Type::Or};
+            cursor++;
+            cursor++;
+            return current();
+          } else {
+            _peek = Token{Token::Type::Pipe};
+            cursor++;
+            return current();
+          }
+        case '~':
+          if (text[cursor + 1] == '=') {
+            _peek = Token{Token::Type::TildeAssign};
+            cursor++;
+            cursor++;
+            return current();
+          } else {
+            _peek = Token{Token::Type::Tilde};
+            cursor++;
+            return current();
+          }
+        default:
+          // string or int.
+          if (isdigit(text[cursor])) {
+            static std::array<char, 1000> buffer;
+            // Deal with integer.
+            size_t start = cursor;
+            while (isdigit(text[cursor++])) {
+            }
+            size_t end = cursor; // end is one past the last digit.
+            if (end - start > buffer.size() - 1) {
+              abort(); // Too big of a number.
+            }
+            size_t j = 0;
+            for (size_t i = start; i < end; i++) {
+              buffer[j++] = text[i];
+            }
+            buffer[j] = '\0';
+            _peek = Token{Token::Type::BigInt};
+            mpz_init(_peek.bigint);
+            mpz_set_str(_peek.bigint, buffer.data(), 10);
+            return current();
+          } else if (isalpha(text[cursor])) {
+            size_t start = cursor;
+            while (isdigit(text[cursor++])) {
+            }
+            size_t end = cursor; // end is one past the last digit.
+            _peek = Token{Token::Type::String};
+            auto temp = std::make_shared<char[]>(end - start + 1);
+            memcpy(temp.get(), &text[start], end - start);
+            temp[static_cast<ptrdiff_t>(end - start)] = '\0';
+            _peek.string = std::move(temp);
+            return current();
+
+          } else {
+            abort(); // Error, unknown token.
+          }
+        }
+      }
+
+      return _current;
+    }
+
+    Token peek() { return _peek; }
+    Token current() { return _current; }
+
+    Token _peek{Token::Type::Eof};
+    Token _current{Token::Type::Eof};
+    const char *text;
+    size_t cursor{0};
+  } lexer;
+  ParserSpec &spec;
+
 public:
-};
+  Parser(const char *text, ParserSpec &_spec) : lexer{text}, spec{_spec} {}
 
-/*
+  bool AtToken(Token::Type t) { return lexer.current().type == t; }
+  void Eat(Token::Type t) {
+    if (!AtToken(t)) {
+      printf("Unexpected ");
+      lexer.current().print();
+      abort();
+    } else {
+      lexer.advance();
+    }
+  }
 
-EOF_TOKEN = Token('eof', 'eof')
+  Node ParseUntil(BindingPower rbp) {
+    if (AtToken(Token::Type::Eof)) {
+      printf("Unexpected end of input!");
+      abort();
+    }
+    auto t = lexer.current();
+    lexer.advance();
+    auto null_info = spec.LookupNull(t);
+    auto node = null_info.nud(*this, t, null_info.bp);
 
+    while (true) {
+      t = lexer.current();
+      auto left_info = spec.LookupLeft(t);
+      if (rbp >= left_info.lbp) {
+        break;
+      }
+      lexer.advance();
+      node = left_info.led(*this, t, node, left_info.rbp);
+    }
+    return node;
+  }
 
-class Parser(object):
-"""Recursive TDOP parser."""
-
-def __init__(self, spec, lexer):
-self.spec = spec
-self.lexer = lexer  # iterable
-self.token = None  # current token
-
-def AtToken(self, token_type):
-"""Test if we are looking at a token."""
-return self.token.type == token_type
-
-def Next(self):
-"""Move to the next token."""
-try:
-  t = self.lexer.__next__()
-except StopIteration:
-  t = EOF_TOKEN
-self.token = t
-
-def Eat(self, val):
-"""Assert the value of the current token, then move to the next token."""
-if val and not self.AtToken(val):
-  raise ParseError('expected %s, got %s' % (val, self.token))
-self.Next()
-
+  /*
 def ParseUntil(self, rbp):
 """
 Parse to the right, eating tokens until we encounter a token with binding
 power LESS THAN OR EQUAL TO rbp.
 """
 if self.AtToken('eof'):
-  raise ParseError('Unexpected end of input')
+raise ParseError('Unexpected end of input')
 
-t = self.token
-self.Next()  # skip over the token, e.g. ! ~ + -
-
-null_info = self.spec.LookupNull(t.type)
-node = null_info.nud(self, t, null_info.bp)
-
-while True:
   t = self.token
-  left_info = self.spec.LookupLeft(t.type)
+          self.Next()  # skip over the token, e.g. ! ~ + -
 
-  # Examples:
-  # If we see 1*2+  , rbp = 27 and lbp = 25, so stop.
-  # If we see 1+2+  , rbp = 25 and lbp = 25, so stop.
-  # If we see 1**2**, rbp = 26 and lbp = 27, so keep going.
-  if rbp >= left_info.lbp:
-    break
-  self.Next()  # skip over the token, e.g. / *
+      null_info = self.spec.LookupNull(t.type)
+            node = null_info.nud(self, t, null_info.bp)
 
-  node = left_info.led(self, t, node, left_info.rbp)
+        while True:
+      t = self.token
+            left_info = self.spec.LookupLeft(t.type)
 
-return node
+# Examples:
+# If we see 1*2+  , rbp = 27 and lbp = 25, so stop.
+# If we see 1+2+  , rbp = 25 and lbp = 25, so stop.
+# If we see 1**2**, rbp = 26 and lbp = 27, so keep going.
+            if rbp >= left_info.lbp:
+      break
+      self.Next()  # skip over the token, e.g. / *
 
-def Parse(self):
-self.Next()
-return self.ParseUntil(0)
-*/
+      node = left_info.led(self, t, node, left_info.rbp)
 
+        return node
+  */
+  /*
+
+  EOF_TOKEN = Token('eof', 'eof')
+
+
+              class Parser(object):
+      """Recursive TDOP parser."""
+
+      def __init__(self, spec, lexer):
+      self.spec = spec
+            self.lexer = lexer  # iterable
+        self.token = None  # current token
+
+            def AtToken(self, token_type):
+      """Test if we are looking at a token."""
+      return self.token.type == token_type
+
+            def Next(self):
+      """Move to the next token."""
+  try:
+      t = self.lexer.__next__()
+            except StopIteration:
+          t = EOF_TOKEN
+                self.token = t
+
+                def Eat(self, val):
+          """Assert the value of the current token, then move to the next
+  token.""" if val and not self.AtToken(val): raise ParseError('expected %s, got
+  %s' % (val, self.token)) self.Next()
+
+
+          def Parse(self):
+          self.Next()
+              return self.ParseUntil(0)
+                  */
+
+  Node Parse() { return ParseUntil(0); }
+};
+
+Node NullConstant(Parser &, Token t, BindingPower) { return Node{t}; }
+
+Node NullParen(Parser &p, Token, BindingPower bp) {
+  auto r = p.ParseUntil(bp);
+  p.Eat(Token::Type::RightParen);
+  return r;
+}
 /*
 #
 # Null Denotation -- token that takes nothing on the left
@@ -447,8 +842,14 @@ def NullParen(p, token, bp):
   r = p.ParseUntil(bp)
   p.Eat(')')
   return r
+*/
 
+Node NullPrefixOp(Parser &p, Token t, BindingPower bp) {
+  auto r = p.ParseUntil(bp);
+  return Node{t, r};
+}
 
+/*
 def NullPrefixOp(p, token, bp):
   """Prefix operator.
 
@@ -459,16 +860,26 @@ def NullPrefixOp(p, token, bp):
   """
   r = p.ParseUntil(bp)
   return CompositeNode(token, [r])
+*/
 
+Node NullIncDec(Parser &p, Token t, BindingPower bp) {
+  auto right = p.ParseUntil(bp);
+  if (right.type != Node::Type::Leaf && right.t.type != Token::Type::String) {
+    abort();
+  }
 
+  return Node{t, right};
+}
+/*
 def NullIncDec(p, token, bp):
   """ ++x or ++x[1] """
   right = p.ParseUntil(bp)
   if right.token.type not in ('name', 'get'):
     raise tdop.ParseError("Can't assign to %r (%s)" % (right, right.token))
   return CompositeNode(token, [right])
+*/
 
-
+/*
 #
 # Left Denotation -- token that takes an expression on the left
 #
@@ -648,7 +1059,7 @@ def main(argv):
 const char *parse(const char *in) { return in; }
 
 int main() {
-  assert(strcmp(parse("1+2*3"), "(+ 1 (* 2 3))"));
+  assert(!strcmp(parse("1+2*3"), "(+ 1 (* 2 3))"));
 
   return 0;
 }

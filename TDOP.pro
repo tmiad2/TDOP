@@ -7,3 +7,6 @@ CONFIG -= qt
 QMAKE_CXXFLAGS += -std=c++20
 SOURCES += \
     main.cpp
+
+unix: CONFIG += link_pkgconfig
+unix: PKGCONFIG += gmp
